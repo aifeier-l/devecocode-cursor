@@ -1,0 +1,83 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Weekly: Monday 04:00 UTC
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/openchamber/opencode-cursor.git
+      UPSTREAM_BRANCH: main
+      SYNC_BRANCH: sync/upstream
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch origin "$UPSTREAM_BRANCH"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Merge upstream and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git checkout -B "$SYNC_BRANCH" "origin/${UPSTREAM_BRANCH}"
+
+          merge_ok=0
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            merge_ok=1
+          else
+            git merge --abort || true
+            echo "Retrying merge with --allow-unrelated-histories"
+            if git merge --no-edit --allow-unrelated-histories "upstream/${UPSTREAM_BRANCH}"; then
+              merge_ok=1
+            fi
+          fi
+
+          if [[ "$merge_ok" -ne 1 ]]; then
+            echo "::error::Upstream merge conflicted. Resolve locally or on the PR branch; main was not updated."
+            git diff --name-only --diff-filter=U || true
+            git merge --abort || true
+            exit 1
+          fi
+
+          if git rev-parse --verify "origin/${SYNC_BRANCH}" >/dev/null 2>&1; then
+            if git diff --quiet "origin/${SYNC_BRANCH}" HEAD; then
+              echo "No new upstream commits to sync."
+              exit 0
+            fi
+          elif git diff --quiet "origin/${UPSTREAM_BRANCH}" HEAD; then
+            echo "No new upstream commits to sync."
+            exit 0
+          fi
+
+          git push -u origin "$SYNC_BRANCH"
+
+          open_count="$(gh pr list --head "$SYNC_BRANCH" --base "$UPSTREAM_BRANCH" --state open --json number --jq 'length')"
+          if [[ "$open_count" == "0" ]]; then
+            gh pr create \
+              --base "$UPSTREAM_BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync upstream openchamber/opencode-cursor" \
+              --body "Weekly sync from [openchamber/opencode-cursor](https://github.com/openchamber/opencode-cursor) \`main\`.
+
+          Review local-only changes (DevEco auth decrypt, OpenCode task bridge, cache-hit / session naming) before merge. Do not force-push to \`main\`."
+          else
+            echo "Open sync PR already exists; branch updated."
+          fi
