@@ -1,5 +1,5 @@
 /**
- * Atomic read/write access to OpenCode's auth.json Cursor entry.
+ * Atomic read/write access to the host auth.json Cursor entry.
  * Single implementation used by plugin config, browser login, and token refresh.
  */
 import {
@@ -9,50 +9,43 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { dirname } from "node:path";
 import { CURSOR_PROVIDER_ID } from "../shared/constants.js";
 import { log } from "../shared/log.js";
-import {
-  isCursorOAuthCredential,
-  type CursorOAuthCredential,
-} from "./credential-manager.js";
-
-function getOpencodeAuthPath(): string {
-  const base =
-    process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  return join(base, "opencode", "auth.json");
-}
+import { getAuthJsonPath } from "./host-paths.js";
+import { unwrapCursorAuth } from "./at-rest-crypto.js";
+import type { CursorOAuthCredential } from "./credential-manager.js";
 
 /**
  * Best-effort read of the stored Cursor OAuth entry.
- * Returns undefined if missing or malformed. Expired access tokens are still
- * returned when a refresh token is present so callers can refresh.
+ *
+ * In plain OpenCode the `access`/`refresh` fields are strings. In DevEco Code
+ * they are AES-256-GCM blobs (see security/local-crypto), so this unwraps them
+ * with the same key chain before validating. Returns undefined when missing or
+ * malformed. Expired access tokens are still returned when a refresh token is
+ * present so callers can refresh.
  */
 export function readStoredCursorAuth(): CursorOAuthCredential | undefined {
   try {
-    const data = JSON.parse(readFileSync(getOpencodeAuthPath(), "utf8"));
-    const cursor = data?.[CURSOR_PROVIDER_ID];
-    if (!isCursorOAuthCredential(cursor)) return undefined;
-    if (!cursor.refresh) return undefined;
-    return {
-      type: "oauth",
-      access: typeof cursor.access === "string" ? cursor.access : undefined,
-      refresh: cursor.refresh,
-      expires: cursor.expires,
-    };
+    const data = JSON.parse(readFileSync(getAuthJsonPath(), "utf8"));
+    return unwrapCursorAuth(data?.[CURSOR_PROVIDER_ID]);
   } catch {
     return undefined;
   }
 }
 
 /**
- * Persist Cursor credentials into OpenCode's auth.json.
- * Uses temp-file + rename for atomicity and preserves other provider entries.
+ * Persist Cursor credentials into the host auth.json.
+ *
+ * In DevEco Code the auth.json is encrypted at rest by the host's Auth service,
+ * so writing plaintext here would corrupt it. Prefer persisting via
+ * `input.client.auth.set` (the host re-encrypts). This disk fallback is kept
+ * for plain OpenCode only and is a best-effort no-op when the file is
+ * encrypted/read in plain OpenCode format only.
  */
 export function writeStoredCursorAuth(auth: CursorOAuthCredential): void {
   try {
-    const authPath = getOpencodeAuthPath();
+    const authPath = getAuthJsonPath();
     mkdirSync(dirname(authPath), { recursive: true });
 
     let data: Record<string, unknown> = {};

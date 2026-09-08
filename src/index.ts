@@ -16,6 +16,8 @@ import {
   encodeCursorModelSelection,
 } from "./model-selection.js";
 import { clearModelCache, resolveCursorModelSelection, type CursorModel } from "./models.js";
+import type { CursorOAuthCredential } from "./auth/credential-manager.js";
+import { log } from "./shared/log.js";
 import { resolveConfigModels } from "./provider/config-models.js";
 import { loadCursorRuntime } from "./provider/credential-runtime.js";
 import { ensureCursorProviderConfig } from "./provider/provider-config.js";
@@ -38,6 +40,29 @@ export const CursorAuthPlugin: Plugin = async (
   };
 
   /**
+   * Persist refreshed credentials through the host so it re-encrypts at rest.
+   * Never writes plaintext into DevEco's encrypted auth.json.
+   */
+  const persistAuth = async (cred: CursorOAuthCredential): Promise<void> => {
+    try {
+      await input.client.auth.set({
+        path: { id: CURSOR_PROVIDER_ID },
+        body: {
+          type: "oauth" as const,
+          refresh: cred.refresh,
+          access: cred.access ?? "",
+          expires: cred.expires,
+        },
+      });
+    } catch (err) {
+      const summary = err instanceof Error ? err.message : String(err);
+      log.warn(
+        `[opencode-cursor] config auth persist skipped: ${summary}`,
+      );
+    }
+  };
+
+  /**
    * Bind the local proxy early (ephemeral port) so the static provider
    * `options.baseURL` OpenCode reads from config points at a live listener.
    * Auth/token wiring is upgraded later by `loadCursorRuntime`.
@@ -56,9 +81,11 @@ export const CursorAuthPlugin: Plugin = async (
   return {
     // Newer OpenCode releases build the model catalog from statically declared
     // `config.provider.<id>` entries. Seed a concrete `cursor` provider so it
-    // always appears; dynamic hooks refine connection details at runtime.
+    // always appears. In DevEco the stored token is encrypted at rest, so we
+    // unwrap it here to discover the real catalog up front (same as upstream,
+    // which reads auth.json). No browser login is started here.
     async config(config) {
-      const models = await resolveConfigModels();
+      const models = await resolveConfigModels(persistAuth);
       rememberModels(models);
       const baseURL = await ensureProxyForConfig(models);
       ensureCursorProviderConfig(config, models, baseURL);
@@ -93,13 +120,14 @@ export const CursorAuthPlugin: Plugin = async (
     provider: {
       id: CURSOR_PROVIDER_ID,
       async models(provider, ctx) {
-        const runtime = await loadCursorRuntime(
-          input,
-          async () => ctx.auth,
-          provider,
-          rememberModels,
+        return (
+          (await loadCursorRuntime(
+            input,
+            async () => ctx.auth,
+            provider,
+            rememberModels,
+          ))?.providerModels ?? {}
         );
-        return runtime?.providerModels ?? {};
       },
     },
 
@@ -133,8 +161,8 @@ export const CursorAuthPlugin: Plugin = async (
           type: "oauth",
           label: "Login with Cursor",
           async authorize() {
-            // Reuse the headless browser login started by the config hook so
-            // OpenChamber / CLI show one URL and share one poll session.
+            // Reuse a pending poll session if OAuth was already started.
+            // config() never starts browser login; authorize() does.
             let pending = getPendingCursorLogin();
             if (!pending || pending.completed) {
               pending = await startCursorBrowserLogin();

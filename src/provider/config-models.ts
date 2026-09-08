@@ -1,12 +1,7 @@
-import {
-  readStoredCursorAuth,
-  writeStoredCursorAuth,
-} from "../auth/opencode-auth-store.js";
-import { ensureValidAccessToken } from "../auth/credential-manager.js";
-import { startCursorBrowserLogin } from "../auth-login.js";
+import { readStoredCursorAuth } from "../auth/opencode-auth-store.js";
+import { ensureValidAccessToken, type CursorOAuthCredential } from "../auth/credential-manager.js";
 import {
   getCursorModels,
-  loginPlaceholderModels,
   LOGIN_PLACEHOLDER_MODELS,
   type CursorModel,
 } from "../models.js";
@@ -29,50 +24,45 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+type Persist = (cred: CursorOAuthCredential) => Promise<void> | void;
+
 /**
  * Resolve the model list used to seed the static provider config. Prefers the
- * full set discovered from Cursor (using the stored OAuth access token) so the
- * whole catalog shows up in the menu.
+ * full set discovered live from Cursor using the stored OAuth access token so
+ * the whole catalog shows up in the menu.
+ *
+ * In DevEco Code the token is encrypted at rest, so `readStoredCursorAuth`
+ * unwraps it with the same key chain the host uses. The refresh path persists
+ * through the caller-provided `persist` (the host's `client.auth.set`), never
+ * writing plaintext to disk.
  *
  * When logged out — or when a stored token cannot discover models — seeds a
  * single login placeholder. OpenCode drops providers with zero models from
- * `provider.list()`, which would hide Cursor in OpenChamber. We intentionally
- * never invent a fake offline catalog for the provider UI.
+ * `provider.list()`, which would hide Cursor. We intentionally never invent a
+ * fake offline catalog for the provider UI.
  *
  * Never throws.
  */
-async function resolveLoggedOutPlaceholder(): Promise<CursorModel[]> {
-  // OpenChamber's provider detail page often skips plugin OAuth methods and
-  // shows a misleading API-key field. Start the same browser OAuth as
-  // `opencode auth login` and embed the URL in the placeholder model name.
-  try {
-    const pending = await startCursorBrowserLogin();
-    return loginPlaceholderModels(pending.url);
-  } catch (err) {
-    const summary = err instanceof Error ? err.message : String(err);
-    log.warn(`[opencode-cursor] failed to start browser login: ${summary}`);
-    return LOGIN_PLACEHOLDER_MODELS;
-  }
-}
-
-export async function resolveConfigModels(): Promise<CursorModel[]> {
+export async function resolveConfigModels(
+  persist?: Persist,
+): Promise<CursorModel[]> {
   const stored = readStoredCursorAuth();
-  if (!stored) return resolveLoggedOutPlaceholder();
+  if (!stored) return LOGIN_PLACEHOLDER_MODELS;
 
   let accessToken: string | undefined;
   try {
     accessToken = await ensureValidAccessToken({
       auth: stored,
-      persist: writeStoredCursorAuth,
+      persist: persist ?? (() => {}),
     });
   } catch (err) {
     const summary = err instanceof Error ? err.message : String(err);
     log.warn(
       `[opencode-cursor] config model discovery refresh failed: ${summary}`,
     );
-    return resolveLoggedOutPlaceholder();
+    return LOGIN_PLACEHOLDER_MODELS;
   }
-  if (!accessToken) return resolveLoggedOutPlaceholder();
+  if (!accessToken) return LOGIN_PLACEHOLDER_MODELS;
 
   // Transient h2-bridge / Cursor API hiccups at plugin load used to fall
   // straight to the login placeholder. Retry discovery briefly before giving up.
@@ -82,10 +72,7 @@ export async function resolveConfigModels(): Promise<CursorModel[]> {
       await new Promise((r) => setTimeout(r, 1_000 * attempt));
     }
     try {
-      discovered = await withTimeout(
-        getCursorModels(accessToken),
-        15_000,
-      );
+      discovered = await withTimeout(getCursorModels(accessToken), 15_000);
     } catch (err) {
       const summary = err instanceof Error ? err.message : String(err);
       log.warn(
@@ -102,5 +89,5 @@ export async function resolveConfigModels(): Promise<CursorModel[]> {
   log.warn(
     "[opencode-cursor] Cursor model discovery returned no models; seeding login placeholder",
   );
-  return resolveLoggedOutPlaceholder();
+  return LOGIN_PLACEHOLDER_MODELS;
 }

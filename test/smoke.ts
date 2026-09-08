@@ -1,7 +1,9 @@
 import http2 from "node:http2";
-import { mkdir, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createCipheriv, randomBytes } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import {
   AgentServerMessageSchema,
@@ -25,6 +27,25 @@ import {
   type TestModules,
 } from "./fixtures/modules";
 import { runExtractedHelperUnitTests } from "./unit/extracted-helpers";
+
+const HOST_DIR_KEYS = ["XDG_DATA_HOME", "XDG_CONFIG_HOME"] as const;
+
+function captureHostDirs(): Record<string, string | undefined> {
+  return Object.fromEntries(HOST_DIR_KEYS.map((k) => [k, process.env[k]]));
+}
+
+function setHostDirs(dataDir: string, configDir: string): void {
+  process.env.XDG_DATA_HOME = dataDir;
+  process.env.XDG_CONFIG_HOME = configDir;
+}
+
+function restoreHostDirs(prev: Record<string, string | undefined>): void {
+  for (const k of HOST_DIR_KEYS) {
+    const v = prev[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
 
 async function testProxyStartStop(modules: TestModules) {
   console.log("[test] Starting proxy...");
@@ -1125,13 +1146,6 @@ async function testConfigHookSeedsProvider(
 ) {
   console.log("[test] Checking config hook seeds cursor provider...");
 
-  const prevXdg = process.env.XDG_DATA_HOME;
-  const loggedOutDir = "/tmp/opencode-cursor-smoke-empty";
-  const loggedInDir = "/tmp/opencode-cursor-smoke-logged-in";
-
-  // Logged out: point the auth store at an empty dir so there is no token.
-  process.env.XDG_DATA_HOME = loggedOutDir;
-
   const fakeInput = {
     client: { auth: { set: async () => {} } },
   } as any;
@@ -1142,17 +1156,30 @@ async function testConfigHookSeedsProvider(
   }
 
   const originalFetch = globalThis.fetch;
+  let cursorAuthFetchCount = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.includes("api2.cursor.sh/auth/poll")) {
-      return new Response("", { status: 404 });
+    if (
+      url.includes("api2.cursor.sh/auth") ||
+      url.includes("cursor.com") ||
+      url.includes("loginDeepControl")
+    ) {
+      cursorAuthFetchCount++;
+      throw new Error(`config() must not contact Cursor auth: ${url}`);
     }
     return originalFetch(input, init);
   }) as typeof fetch;
 
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "composer-2", name: "Composer 2", reasoning: true },
+  ]);
+  backend.setAvailableModels(undefined);
+
   try {
-  // Fresh config while logged out: keep a single login placeholder so OpenCode
-  // / OpenChamber still list the Cursor provider (empty models are dropped).
+  // Keep a single static placeholder so OpenCode / OpenChamber still list
+  // Cursor. config() must not read disk auth, refresh, discover, or login.
   const fresh: any = {};
   await hooks.config!(fresh);
   const cursor = fresh.provider?.cursor;
@@ -1177,32 +1204,57 @@ async function testConfigHookSeedsProvider(
   assertEqual(
     Object.keys(cursor.models ?? {}).length,
     1,
-    "Expected a single login placeholder model when logged out",
+    "Expected a single stable placeholder model from config()",
   );
   assert(
     "default" in (cursor.models ?? {}),
-    "Expected login placeholder default model when logged out",
+    "Expected login placeholder default model from config()",
   );
-  assert(
-    typeof cursor.models.default.name === "string" &&
-      (cursor.models.default.name.startsWith("OPEN THIS URL TO LOGIN → ") ||
-        cursor.models.default.name === "Cursor (authorize to load models)"),
-    `Expected login placeholder to embed browser URL or authorize hint, got '${cursor.models.default.name}'`,
+  assertEqual(
+    cursor.models.default.name,
+    "Cursor (authorize to load models)",
+    "Expected static placeholder, not an embedded browser login URL",
   );
-  if (cursor.models.default.name.startsWith("OPEN THIS URL TO LOGIN → ")) {
-    assert(
-      cursor.models.default.name.includes("cursor.com") ||
-        cursor.models.default.name.includes("loginDeepControl"),
-      "Expected embedded login URL to point at Cursor",
-    );
-  }
   assert(
     !("composer-1" in (cursor.models ?? {})),
-    "Expected fallback model composer-1 not to be seeded when logged out",
+    "Expected fallback model composer-1 not to be seeded by config()",
+  );
+  assert(
+    !("composer-2" in (cursor.models ?? {})),
+    "Expected config() not to seed discovered models",
+  );
+  assertEqual(
+    cursor.models.default.reasoning,
+    false,
+    "Expected cursor/default not to generate misleading reasoning variants",
+  );
+  assertEqual(
+    cursor.models.default.variants.low.disabled,
+    true,
+    "Expected cursor/default low variant to be suppressed",
+  );
+  assertEqual(
+    cursor.models.default.variants.max.disabled,
+    true,
+    "Expected cursor/default max variant to be suppressed",
+  );
+  assertEqual(
+    cursorAuthFetchCount,
+    0,
+    "Expected config() not to start browser login or poll Cursor auth",
+  );
+  assertEqual(
+    backend.getDiscoveryAuthHeaders().length,
+    0,
+    "Expected config() not to discover Cursor models",
+  );
+  assertEqual(
+    backend.getRefreshAuthHeaders().length,
+    0,
+    "Expected config() not to refresh tokens",
   );
 
-  // User overrides must be preserved; logged-out must not inject the full
-  // fallback catalog over a user's explicit model list.
+  // User overrides must be preserved; config() must not inject a catalog.
   const custom: any = {
     provider: {
       cursor: {
@@ -1226,97 +1278,8 @@ async function testConfigHookSeedsProvider(
   assert("my-model" in c2.models, "Expected user model to be preserved");
   assert(
     !("composer-1" in c2.models),
-    "Expected offline placeholder only when logged out",
+    "Expected config() not to inject the offline catalog",
   );
-
-  // Logged in with empty discovery: seed login placeholder, never a fake catalog.
-  await mkdir(join(loggedInDir, "opencode"), { recursive: true });
-  await writeFile(
-    join(loggedInDir, "opencode", "auth.json"),
-    JSON.stringify({
-      cursor: {
-        type: "oauth",
-        access: "smoke-test-access-token",
-        refresh: "smoke-test-refresh",
-        expires: Date.now() + 3_600_000,
-      },
-    }),
-  );
-  process.env.XDG_DATA_HOME = loggedInDir;
-  modules.clearModelCache();
-  backend.setAvailableModels(undefined);
-  backend.setDiscoveryMode("empty");
-
-  const loggedInHooks = await modules.CursorAuthPlugin(fakeInput);
-  const degraded: any = {};
-  await loggedInHooks.config!(degraded);
-  const degradedCursor = degraded.provider?.cursor;
-  assert(degradedCursor, "Expected config hook to create provider.cursor");
-  assertEqual(
-    Object.keys(degradedCursor.models ?? {}).length,
-    1,
-    "Expected login placeholder instead of a fake catalog when discovery fails",
-  );
-  assert(
-    "default" in degradedCursor.models,
-    "Expected login placeholder default model when discovery fails",
-  );
-  assert(
-    !("composer-1" in degradedCursor.models),
-    "Expected fallback model composer-1 not to be seeded when discovery fails",
-  );
-  assertEqual(
-    degradedCursor.models.default.reasoning,
-    false,
-    "Expected cursor/default not to generate misleading reasoning variants",
-  );
-  assertEqual(
-    degradedCursor.models.default.variants.low.disabled,
-    true,
-    "Expected cursor/default low variant to be suppressed",
-  );
-  assertEqual(
-    degradedCursor.models.default.variants.max.disabled,
-    true,
-    "Expected cursor/default max variant to be suppressed",
-  );
-
-  // Logged in with successful discovery: seed the live catalog (not fallback).
-  modules.clearModelCache();
-  backend.setDiscoveryMode("success");
-  backend.setDiscoveredModels([
-    { id: "composer-2", name: "Composer 2", reasoning: true },
-    { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true },
-  ]);
-  // AvailableModels path takes priority; leave it unset so GetUsableModels is used.
-  backend.setAvailableModels(undefined);
-
-  const liveHooks = await modules.CursorAuthPlugin(fakeInput);
-  const live: any = {};
-  await liveHooks.config!(live);
-  const liveCursor = live.provider?.cursor;
-  assert(liveCursor, "Expected config hook to create provider.cursor");
-  assert(
-    "composer-2" in liveCursor.models,
-    "Expected discovered composer-2 when logged in with successful discovery",
-  );
-  assert(
-    "claude-4.6-sonnet-medium" in liveCursor.models,
-    "Expected discovered claude model when logged in with successful discovery",
-  );
-  assert(
-    !("composer-1" in liveCursor.models) || liveCursor.models["composer-2"],
-    "Expected live discovery catalog rather than only placeholders",
-  );
-
-  backend.setDiscoveryMode("success");
-  modules.clearModelCache();
-
-  if (prevXdg === undefined) {
-    delete process.env.XDG_DATA_HOME;
-  } else {
-    process.env.XDG_DATA_HOME = prevXdg;
-  }
 
   console.log("[test] Config hook seeding OK");
   } finally {
@@ -1324,6 +1287,115 @@ async function testConfigHookSeedsProvider(
     modules.resetPendingCursorLogin();
     modules.stopProxy();
   }
+}
+
+/**
+ * DevEco Code encrypts auth.json at rest (aes-256-gcm, DEK wrapped by a KEK).
+ * config() must be able to unwrap the Cursor token from disk (without a host
+ * auth API). This builds a throwaway encrypted auth tree and verifies both the
+ * raw decrypt and the config() discovery path.
+ */
+async function testConfigDecryptsStoredAuth(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] config() decrypts DevEco encrypted auth...");
+  const prev = captureHostDirs();
+  const base = mkdtempSync(join(tmpdir(), "cursor-auth-"));
+  const cfgBase = join(base, "cfg");
+  const dataBase = join(base, "data");
+  const cfgDir = join(cfgBase, "deveco");
+  const dataDir = join(dataBase, "deveco");
+  mkdirSync(join(cfgDir, "keys"), { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+
+  const kek = randomBytes(32);
+  writeFileSync(join(cfgDir, "keys", "kek-v1.bin"), kek);
+
+  const gcm = (key: Buffer, plain: Buffer) => {
+    const iv = randomBytes(12);
+    const c = createCipheriv("aes-256-gcm", key, iv);
+    const ct = Buffer.concat([c.update(plain), c.final()]);
+    return { iv, authTag: c.getAuthTag(), ciphertext: ct };
+  };
+
+  const dek = randomBytes(32);
+  const wrapped = gcm(kek, dek);
+  writeFileSync(
+    join(cfgDir, "token.dek"),
+    JSON.stringify({
+      version: 1,
+      algorithm: "aes-256-gcm",
+      kekId: "kek-v1",
+      encryptedDek: wrapped.ciphertext.toString("base64"),
+      iv: wrapped.iv.toString("base64"),
+      authTag: wrapped.authTag.toString("base64"),
+      timeStamp: Date.now(),
+    }),
+  );
+
+  const access = "plain-access-token";
+  const refresh = "plain-refresh-token";
+  const enc = (plain: string) => {
+    const r = gcm(dek, Buffer.from(plain, "utf8"));
+    return {
+      version: 1,
+      algorithm: "aes-256-gcm",
+      ciphertext: r.ciphertext.toString("base64"),
+      iv: r.iv.toString("base64"),
+      authTag: r.authTag.toString("base64"),
+      timeStamp: Date.now(),
+    };
+  };
+  writeFileSync(
+    join(dataDir, "auth.json"),
+    JSON.stringify({
+      cursor: {
+        type: "oauth",
+        access: enc(access),
+        refresh: enc(refresh),
+        expires: Date.now() + 3_600_000,
+      },
+    }),
+  );
+
+  setHostDirs(dataBase, cfgBase);
+
+  try {
+    const { readStoredCursorAuth } = await import("../src/auth/opencode-auth-store.js");
+    const cred = readStoredCursorAuth();
+    assert(cred, "Expected encrypted stored auth to decrypt");
+    assertEqual(cred!.access, access, "Expected decrypted access token");
+    assertEqual(cred!.refresh, refresh, "Expected decrypted refresh token");
+
+    // config() should now seed the real catalog (not a placeholder).
+    modules.clearModelCache();
+    backend.resetObservations();
+    backend.setDiscoveryMode("success");
+    backend.setDiscoveredModels([{ id: "composer-2", name: "Composer 2", reasoning: true }]);
+    backend.setAvailableModels(undefined);
+
+    const hooks = await modules.CursorAuthPlugin({
+      client: { auth: { set: async () => {} } },
+    } as any);
+    const cfg: any = {};
+    await hooks.config!(cfg);
+    const cursor = cfg.provider?.cursor;
+    assert(cursor, "Expected config hook to create provider.cursor");
+    assert(
+      "composer-2" in (cursor.models ?? {}),
+      "Expected config() to seed discovered models from decrypted disk auth",
+    );
+    assertEqual(
+      Object.keys(cursor.models ?? {}).length >= 1,
+      true,
+      "Expected a catalog from config()",
+    );
+  } finally {
+    restoreHostDirs(prev);
+    modules.stopProxy();
+  }
+  console.log("[test] config() DevEco decrypt OK");
 }
 
 async function testArrayContentParsing(modules: TestModules) {
@@ -1664,6 +1736,59 @@ async function testDiscoveryPlaceholderAndSuccess(
 
   modules.stopProxy();
   console.log("[test] Discovery placeholder and success OK");
+}
+
+async function testProviderModelsUsesCtxAuth(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Checking provider.models uses ctx.auth...");
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "ctx-auth-model", name: "Ctx Auth Model", reasoning: true },
+  ]);
+  backend.setAvailableModels(undefined);
+
+  const authState = {
+    type: "oauth" as const,
+    access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+    refresh: "valid-refresh",
+    expires: Date.now() + 3_600_000,
+  };
+  const hooks = await modules.CursorAuthPlugin({
+    client: {
+      auth: {
+        set: async () => {},
+      },
+    },
+  } as any);
+  const provider = { models: {} as Record<string, unknown> } as any;
+  assert(
+    typeof hooks.provider?.models === "function",
+    "Expected plugin provider.models hook",
+  );
+
+  const models = await hooks.provider.models(provider, { auth: authState });
+  assert(
+    "ctx-auth-model" in models,
+    "Expected provider.models to discover via ctx.auth",
+  );
+  assert(
+    "ctx-auth-model" in provider.models,
+    "Expected provider.models to update the provider catalog",
+  );
+  assert(
+    backend.getDiscoveryAuthHeaders().length > 0 &&
+      backend.getDiscoveryAuthHeaders().every(
+        (header) => header === `Bearer ${authState.access}`,
+      ),
+    `Expected provider.models discovery to use ctx.auth access token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
+  );
+
+  modules.stopProxy();
+  console.log("[test] provider.models ctx.auth OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -3276,6 +3401,14 @@ async function main() {
 
   const modules = await loadTestModules();
 
+  // Config() reads the host auth.json to decrypt DevEco credentials. Point the
+  // host data/config dirs at an empty temp dir so the rest of the suite is
+  // hermetic (no real credentials on disk). The dedicated decrypt test manages
+  // its own dirs.
+  const hostPrev = captureHostDirs();
+  const emptyBase = mkdtempSync(join(tmpdir(), "cursor-empty-"));
+  setHostDirs(emptyBase, emptyBase);
+
   try {
     await runExtractedHelperUnitTests();
     await testProxyStartStop(modules);
@@ -3287,12 +3420,14 @@ async function main() {
     await testCursorModelVariantGrouping(modules);
     await testCursorVariantHooks(modules, backend);
     await testConfigHookSeedsProvider(modules, backend);
+    await testConfigDecryptsStoredAuth(modules, backend);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testRefreshFailureKeepsProviderListable(modules, backend);
     await testRefreshPreservesOriginalWhenResponseRefreshIsNotJwt(modules, backend);
     await testRefreshRotatesWhenResponseRefreshIsJwt(modules, backend);
     await testDiscoveryPlaceholderAndSuccess(modules, backend);
+    await testProviderModelsUsesCtxAuth(modules, backend);
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
@@ -3326,6 +3461,7 @@ async function main() {
     console.error("\n✗ Smoke test failed:", err);
     process.exit(1);
   } finally {
+    restoreHostDirs(hostPrev);
     modules.stopProxy();
     await backend.close();
   }
